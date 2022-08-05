@@ -3,6 +3,7 @@ import pandas as pd
 import seaborn as sns
 from pandas.api.types import CategoricalDtype
 import matplotlib.pyplot as plt
+import numpy as np
 
 #The default expected header of a snp-stats input file
 HEADER = "alternate_ids rsid chromosome position alleleA alleleB comment HW_exact_p_value HW_lrt_p_value alleleA_count alleleB_count alleleA_frequency alleleB_frequency minor_allele_frequency minor_allele major_allele info impute_info missing_proportion A B AA AB BB NULL total"
@@ -103,21 +104,23 @@ class Entry:
             f(Entry(line.split()))
 
     @staticmethod
-    def for_folder(folder, f, g = lambda x: None):
+    def for_folder(folder, f, g = lambda x: None, chrs = range(1, 23)):
         '''Iterates over an entire folder an runs f on each line in a snp stats file in the folder. The folder must have files for all 22 autosomes labeled chrN-snp-stats.txt. The function f is run for each entry in each file. The function g is run once before each chromosome file is read.'''
-        for i in range(1, 23):
+        for i in chrs:
             g(i)
             Entry.for_entry(open(folder + '/' + file_name(i), 'r'), f)
 
 class Bin:
     '''A utility class that represents a 'bin' of items within a range where the average and count are important but each individual value is not essential.'''
-    def __init__(self, minimum, maximum):
+    def __init__(self, minimum, maximum, catchall = False):
         self.minimum = minimum
         self.maximum = maximum
+        self.catchall = catchall
         self.n = 0
         self.average = 0
 
     def __str__(self):
+        if self.catchall: return "unknown"
         return str(self.minimum) + "-" + str(self.maximum)
 
     def add(self, value):
@@ -127,7 +130,7 @@ class Bin:
 
     def in_range(self, item):
         '''Returns whether the given value is in the range of the bin'''
-        return (self.minimum < item) and (item < self.maximum)
+        return (self.minimum < item) and (item < self.maximum) or self.catchall
 
     def add_if_in_range(self, x, y):
         '''Adds y is x is in the range of the bin and returns whether the values was added.'''
@@ -166,6 +169,12 @@ class Bin:
         ]
 
     @staticmethod
+    def catchall_bins():
+        bins = Bin.default_bins()
+        bins.append(Bin(0, 0, catchall=True))
+        return bins
+
+    @staticmethod
     def find_bin(bins, item):
         '''Returns the first bin that the items belongs in.'''
         for bin in bins:
@@ -185,15 +194,8 @@ def file_name(chrom, prefix="", suffix="-snp-stats.txt"):
     '''Returns the expected snp-stats file name for a file'''
     return "chr" + str(chrom) + "-snp-stats.txt"
 
-hits = 0
-misses = 0
-dest_file = None
-
 def remaf(source, maffile, dest):
     '''Copies files from the source folder to the destination folder, replace variant MAF with the MAF in the given file or -1 if not found. The format of the MAF file must be CHR POS MAF MAJ MIN'''
-    global hits
-    global misses
-    global dest_file
     print("Running Remaf")
 
     print("Loading MAF Reader")
@@ -201,9 +203,9 @@ def remaf(source, maffile, dest):
     print("MAF Reader Loaded")
 
     def process_entry(entry):
-        global hits
-        global misses
-        global dest_file
+        nonlocal hits
+        nonlocal misses
+        nonlocal dest_file
         pos = entry.pos()
         chr = entry.chr()
 
@@ -245,14 +247,20 @@ def lineplot(source, output):
 
     stats = {'info': [], 'bin': [], 'panel': []}
 
-    for folder in args.source:
+    for argument in args.source:
+        arguments = argument.split(":") 
+        folder = arguments[0]
 
+        if(len(arguments) > 1):
+            if(arguments[1] == "alt"): use_alt_header()
         def process_entry(entry):
             nonlocal stats, bins
             info = entry.info()
             maf = entry.maf()
             if info == -1: return
             if maf == -1: return
+            if info < 0: info = 0.1e-10
+            if info > 1: info = 0.99999
             stats['info'].append(info)
             stats['bin'].append(str(Bin.find_bin(bins, maf)))
             stats['panel'].append(folder)
@@ -269,35 +277,47 @@ def lineplot(source, output):
 
     stats['bin'] = stats['bin'].astype(order)
 
+    stats.to_csv("stats.csv")
+
     print("Generating Plot")
 
     sns.set_style("whitegrid")
 
+    plt.figure(figsize=(11, 8))
     plot = sns.lineplot(data = stats.sort_values('bin'), x='bin', y='info', hue='panel', sort=False)
 
     plot.set(xlabel="MAF", ylabel="Info")
     plot.set(title="Average Info by MAF")
     plt.xticks(rotation=75)
+    plt.xlim(str(bins[0]), str(bins[-1]))
     plt.grid(b=True)
     plt.tight_layout()
 
-    plt.savefig(args.output, format="svg")
+    plt.savefig(output, format="svg")
 
     print("Done")
 
-def barplot(source, output, thresholds, y_range=None):
+def export_legend(legend, filename="legend.png", expand=[-5,-5,5,5]):
+    fig  = legend.figure
+    fig.canvas.draw()
+    bbox  = legend.get_window_extent()
+    bbox = bbox.from_extents(*(bbox.extents + np.array(expand)))
+    bbox = bbox.transformed(fig.dpi_scale_trans.inverted())
+    fig.savefig(filename, format='svg', bbox_inches=bbox)
+
+def barplot(source, output, thresholds, y_range=None, units = 1, hide_legend=False, legend_file=None, data_file=None):
     print("Generating Barplot")
         
     n = len(args.thresholds)
     ranges = [None] * n
-    ranges[0] = vc.Bin(0, args.thresholds[0])
+    ranges[0] = Bin(0, args.thresholds[0])
     
-    for i in range(len(args.thresholds) - 1): ranges[i + 1] = vc.Bin(args.thresholds[i], args.thresholds[i + 1])
+    for i in range(len(args.thresholds) - 1): ranges[i + 1] = Bin(args.thresholds[i], args.thresholds[i + 1])
 
-    ranges.append(vc.Bin(args.thresholds[-1], 1))
+    ranges.append(Bin(args.thresholds[-1], 1))
     
     bins = Bin.default_bins()
-    categories = [str(b): vc.Bin.default_bins() for b in ranges } 
+    categories = {str(b): Bin.default_bins() for b in ranges } 
 
     def update_count(entry):
         nonlocal categories
@@ -305,20 +325,45 @@ def barplot(source, output, thresholds, y_range=None):
         maf = entry.maf()
         if info == -1: return
         if maf == -1: return
+        if info < 0: info = 0.1
+        if info > 1: info = 0.99
         for band in ranges:
-            if band.in_range(enty.info()):
+            if band.in_range(entry.info()):
                 Bin.sort(categories[str(band)], maf, info)
 
     Entry.for_folder(source, update_count, lambda x: print(f"Reading chr{x}"))
 
     print("Generating Plot")
 
-    bars = pd.DataFrame({band: [b.count() for b in bins] for (band, bins) in categories.items{}}, index = [str(b) for b in bins])
+    bars = pd.DataFrame({band: [b.count() / units for b in bins] for (band, bins) in categories.items()}, index = [str(b) for b in bins])
+
+    if data_file: bars.to_csv(data_file)
+
+    bars.plot(kind = 'bar', stacked = True)
+    plt.title(f"{source}", pad=20)
+
+    if y_range: plt.ylim(0, y_range / units)
+
+    plt.xlabel("MAF")
+    plt.ylabel(f"Number per {units}")
+    plt.xticks(rotation = 90)
+    legend = plt.legend(reversed(plt.legend().legendHandles), reversed(categories.keys()), loc='upper right', title = "Info")
+
+    if legend_file:
+        export_legend(legend, filename=legend_file)
+
+    if hide_legend:
+        legend.remove()
+
+    plt.savefig(output, bbox_inches='tight', format='svg')
+
+    print("Done")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-p', nargs='?', default="", type=str, help="The file prefix before the chromosome number of each snp-stats file")
 parser.add_argument('-P', nargs='?', default="-snp-stats.txt", type=str, help="The file suffix bfore the chromosome number of each snp-stats file")
 parser.add_argument('-r', nargs=2, default=[1,22], type=int)
+parser.add_argument('-c', type=str, help="The seaborn context to use for graphing")
 
 subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -335,13 +380,19 @@ lineplot_parser.add_argument("source", type=str, nargs="+", help="The folders co
 lineplot_parser.add_argument("output", type=argparse.FileType('w'), help="The file to write the graph to")
 
 barplot_parser.add_argument("source", type=str, help="The folder containing snp-stats data")
-barplot_parser.add_argument("output", type=argparser.FileType('w'), help="The image file to save the graph in")
+barplot_parser.add_argument("output", type=argparse.FileType('w'), help="The image file to save the graph in")
 barplot_parser.add_argument("thresholds", type=float, nargs="+", help="The info thresholds to divide the variants by")
+barplot_parser.add_argument("-m", type=int, help="Maximum value on y-axis")
+barplot_parser.add_argument("-u", type=int, default=1, help="The units of the y-axis")
+barplot_parser.add_argument("--save-legend", type=str, help="A separate file to save the legend to")
+barplot_parser.add_argument("--hide-legend", action="store_true")
+barplot_parser.add_argument("--save-frame", type=str, help="A separate file to save the dataframe generated during the graphing process")
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
     chromosomes = range(args.r[0], args.r[1] + 1)
+    if args.c: sns.set_context(args.c)
 
     if args.command == "remaf":
         remaf(args.source, args.maffile, args.dest)
@@ -350,7 +401,7 @@ if __name__ == "__main__":
         lineplot(args.source, args.output)
 
     elif args.command == "barplot":
-        barplot(args.source, args.output, args.thresholds, y_range= args.m if args.m else None)
+        barplot(args.source, args.output, args.thresholds, y_range= args.m, units = args.u, legend_file = args.save_legend, hide_legend = args.hide_legend)
 
     elif args.command == "test":
         print(args)
